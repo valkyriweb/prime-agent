@@ -1,1 +1,1 @@
-- Fixed `rlm.collect(..., timeout_ms=N)` returning at once with `running` children when called in the same turn as `rlm.spawn` in a daemon session: a blocking collect now releases the children's held task prompts and waits for them to settle.
+- Fixed `rlm.collect(..., timeout_ms=N)` returning at once with `running` children when called in the same turn as `rlm.spawn` in a daemon session: a blocking collect now releases its targets' held task prompts and waits for them to settle. A `timeout_ms=0` poll does not release held prompts.

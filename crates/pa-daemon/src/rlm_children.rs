@@ -195,6 +195,10 @@ struct ChildRecord {
     /// The task prompt was admitted; never settle a pre-prompt child (it
     /// is idle with an empty queue by construction).
     prompt_admitted: bool,
+    /// Set by a blocking `collect` that targets this child before its
+    /// prompt admitted: the held task prompt starts without waiting for the
+    /// spawning turn to complete (the collect parks that turn).
+    prompt_release: Arc<std::sync::atomic::AtomicBool>,
     /// Terminal error text: the cancel reason for a cancelled run, the
     /// failure text for a failed one.
     error: Option<String>,
@@ -372,9 +376,6 @@ enum RetirementIntent {
 struct ParentTurn {
     completed: u64,
     running: bool,
-    /// Bumped by a blocking `collect`: the collect parks the spawning turn,
-    /// so a prompt held for that turn's end is released instead.
-    released: u64,
 }
 
 #[derive(Clone)]
@@ -786,6 +787,7 @@ impl SupervisorChildSessions {
                 notice_delivered: false,
                 factory: false,
                 prompt_admitted: true,
+                prompt_release: Arc::default(),
                 error: None,
                 closed_by_parent: false,
                 retiring: false,
@@ -1067,14 +1069,14 @@ impl SupervisorChildSessionsInner {
 
     /// Wait for the parent turn that spawned a task to complete (generation
     /// strictly greater than the one captured at spawn admission), or for a
-    /// blocking `collect` to release it. Bounded: a turn that never settles
-    /// releases the child anyway.
-    pub async fn wait_turn_done(&self, spawned_in: ParentTurn) {
+    /// blocking `collect` to set `release` (it wakes the turn channel).
+    /// Bounded: a turn that never settles releases the child anyway.
+    pub async fn wait_turn_done(&self, generation: u64, release: &std::sync::atomic::AtomicBool) {
         let mut receiver = self.parent_turn.subscribe();
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(TURN_DONE_WAIT_SECS),
             receiver.wait_for(|turn| {
-                turn.completed > spawned_in.completed || turn.released > spawned_in.released
+                turn.completed > generation || release.load(std::sync::atomic::Ordering::SeqCst)
             }),
         )
         .await;

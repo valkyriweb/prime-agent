@@ -620,6 +620,7 @@ fn ledger_child_records(
             notice_delivered: true,
             factory: edge.factory.is_some(),
             prompt_admitted: true,
+            prompt_release: Arc::default(),
             error: None,
             closed_by_parent: false,
             retiring: false,

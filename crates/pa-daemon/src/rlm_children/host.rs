@@ -180,6 +180,7 @@ impl RlmSubagentHost for SupervisorChildSessions {
                     notice_delivered: false,
                     factory: request.factory.is_some(),
                     prompt_admitted: false,
+                    prompt_release: Arc::default(),
                     error: None,
                     closed_by_parent: false,
                     retiring: false,
@@ -256,11 +257,14 @@ impl RlmSubagentHost for SupervisorChildSessions {
             // to wait for.
             let spawning_turn = {
                 let turn = *this.parent_turn.borrow();
-                turn.running.then_some(turn)
+                turn.running.then_some(turn.completed)
             };
+            let prompt_release = Arc::clone(&record.lock().await.prompt_release);
             tokio::spawn(async move {
-                if let Some(turn) = spawning_turn {
-                    watcher_this.wait_turn_done(turn).await;
+                if let Some(generation) = spawning_turn {
+                    watcher_this
+                        .wait_turn_done(generation, &prompt_release)
+                        .await;
                 }
                 // The parent closed before the prompt admitted: the
                 // child is closed with it, so the detached task prompt
@@ -626,9 +630,19 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 // A blocking collect parks the spawning turn, so a task
                 // prompt held for that turn's end would start only after
                 // the hold times out, and the idle wait below would read the
-                // pre-prompt idle worker and return at once. Release the held
-                // prompts and wait for their admission inside the budget.
-                this.parent_turn.send_modify(|turn| turn.released += 1);
+                // pre-prompt idle worker and return at once. Release the
+                // targets' held prompts (only theirs: other children keep
+                // the turn ordering) and wait for their admission inside the
+                // budget.
+                for record in &records {
+                    record
+                        .lock()
+                        .await
+                        .prompt_release
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                // Wake the held prompt tasks: their wait re-reads the flag.
+                this.parent_turn.send_modify(|_turn| {});
                 for record in &records {
                     loop {
                         let admission = this.prompt_admission.notified();
