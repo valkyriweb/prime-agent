@@ -256,16 +256,17 @@ impl RlmSubagentHost for SupervisorChildSessions {
             // to wait for.
             let spawning_turn = {
                 let turn = *this.parent_turn.borrow();
-                turn.running.then_some(turn.completed)
+                turn.running.then_some(turn)
             };
             tokio::spawn(async move {
-                if let Some(generation) = spawning_turn {
-                    watcher_this.wait_turn_done(generation).await;
+                if let Some(turn) = spawning_turn {
+                    watcher_this.wait_turn_done(turn).await;
                 }
                 // The parent closed before the prompt admitted: the
                 // child is closed with it, so the detached task prompt
                 // never fires.
                 if watcher_record.lock().await.closed_by_parent {
+                    watcher_this.prompt_admission.notify_waiters();
                     return;
                 }
                 if let Err(error) = watcher_this
@@ -305,12 +306,14 @@ impl RlmSubagentHost for SupervisorChildSessions {
                         watcher_this
                             .settle_failed(&watcher_record, format!("{retry_error:#}"))
                             .await;
+                        watcher_this.prompt_admission.notify_waiters();
                         return;
                     }
                 }
                 // The worker accepted the task: from here an idle read is a
                 // finished run, never the pre-prompt idle worker.
                 watcher_record.lock().await.prompt_admitted = true;
+                watcher_this.prompt_admission.notify_waiters();
                 watcher_this.watch_child_settle(&watcher_record).await;
             });
             Ok(RlmSpawnHandle {
@@ -619,6 +622,36 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 records.push(record);
             }
             let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+            if timeout_ms > 0 {
+                // A blocking collect parks the spawning turn, so a task
+                // prompt held for that turn's end would start only after
+                // the hold times out, and the idle wait below would read the
+                // pre-prompt idle worker and return at once. Release the held
+                // prompts and wait for their admission inside the budget.
+                this.parent_turn.send_modify(|turn| turn.released += 1);
+                for record in &records {
+                    loop {
+                        let admission = this.prompt_admission.notified();
+                        tokio::pin!(admission);
+                        admission.as_mut().enable();
+                        {
+                            let record = record.lock().await;
+                            if record.prompt_admitted
+                                || record.settled_status.is_some()
+                                || record.closed_by_parent
+                            {
+                                break;
+                            }
+                        }
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        if remaining.is_zero()
+                            || tokio::time::timeout(remaining, admission).await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
             let mut results = Vec::with_capacity(records.len());
             for record in &records {
                 this.refresh_record(record).await;
