@@ -189,6 +189,7 @@ impl RlmSubagentHost for SupervisorChildSessions {
                     notice_delivered: false,
                     factory: request.factory.is_some(),
                     prompt_admitted: false,
+                    prompt_release: Arc::default(),
                     retirement: Retirement::live(),
                     usage_registration_forgotten: false,
                     session_file: created.session_file.clone(),
@@ -262,14 +263,18 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 let turn = *this.parent_turn.borrow();
                 turn.running.then_some(turn.completed)
             };
+            let prompt_release = Arc::clone(&record.lock().await.prompt_release);
             tokio::spawn(async move {
                 if let Some(generation) = spawning_turn {
-                    watcher_this.wait_turn_done(generation).await;
+                    watcher_this
+                        .wait_turn_done(generation, &prompt_release)
+                        .await;
                 }
                 // The parent closed before the prompt admitted: the
                 // child is closed with it, so the detached task prompt
                 // never fires.
                 if watcher_record.lock().await.retirement.closed_by_parent() {
+                    watcher_this.prompt_admission.notify_waiters();
                     return;
                 }
                 if let Err(error) = watcher_this
@@ -309,12 +314,14 @@ impl RlmSubagentHost for SupervisorChildSessions {
                         watcher_this
                             .settle_failed(&watcher_record, format!("{retry_error:#}"))
                             .await;
+                        watcher_this.prompt_admission.notify_waiters();
                         return;
                     }
                 }
                 // The worker accepted the task: from here an idle read is a
                 // finished run, never the pre-prompt idle worker.
                 watcher_record.lock().await.prompt_admitted = true;
+                watcher_this.prompt_admission.notify_waiters();
                 watcher_this.watch_child_settle(&watcher_record).await;
             });
             Ok(RlmSpawnHandle {
@@ -631,6 +638,46 @@ impl RlmSubagentHost for SupervisorChildSessions {
                 records.push(record);
             }
             let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+            if timeout_ms > 0 {
+                // A blocking collect parks the spawning turn, so a task
+                // prompt held for that turn's end would start only after
+                // the hold times out, and the idle wait below would read the
+                // pre-prompt idle worker and return at once. Release the
+                // targets' held prompts (only theirs: other children keep
+                // the turn ordering) and wait for their admission inside the
+                // budget.
+                for record in &records {
+                    record
+                        .lock()
+                        .await
+                        .prompt_release
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                // Wake the held prompt tasks: their wait re-reads the flag.
+                this.parent_turn.send_modify(|_turn| {});
+                for record in &records {
+                    loop {
+                        let admission = this.prompt_admission.notified();
+                        tokio::pin!(admission);
+                        admission.as_mut().enable();
+                        {
+                            let record = record.lock().await;
+                            if record.prompt_admitted
+                                || !record.run.is_running()
+                                || record.retirement.closed_by_parent()
+                            {
+                                break;
+                            }
+                        }
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        if remaining.is_zero()
+                            || tokio::time::timeout(remaining, admission).await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
             let mut results = Vec::with_capacity(records.len());
             for record in &records {
                 this.refresh_record(record).await;

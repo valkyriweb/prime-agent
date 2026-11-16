@@ -892,6 +892,31 @@ async fn a_child_spawned_mid_turn_prompts_after_the_parent_turn_completes() {
     gate.release.notify_one();
 }
 
+/// A blocking `collect` inside the spawning turn releases the held task
+/// prompt: the collect parks that turn, so the turn boundary cannot arrive
+/// before the collect's budget ends, and the pre-prompt idle worker must not
+/// answer the wait at once.
+#[tokio::test]
+async fn a_blocking_collect_mid_turn_releases_the_held_task_prompt() {
+    let (follow_up_tx, _follow_up_rx) = mpsc::unbounded_channel();
+    let (sessions, _kill_rx) =
+        sessions_with_fake_supervisor(follow_up_tx, 0, FakeKill::Success, FakeChild::Healthy).await;
+    sessions.notify_turn_started();
+    let handle = spawn_child(&sessions).await;
+
+    let collected = tokio::time::timeout(
+        Duration::from_secs(10),
+        sessions.collect(vec![handle.rlm_child_id.clone()], 30_000),
+    )
+    .await
+    .expect("the collect must not wait out the turn-boundary hold")
+    .expect("collect mid-turn");
+    assert_eq!(
+        (collected[0].status, collected[0].answer_text.as_deref()),
+        ("done", Some("the child final answer"))
+    );
+}
+
 /// A `collect` that lands while the task prompt is still in flight reads
 /// the child's pre-prompt idle worker: the child is still running, never a
 /// `done` settle with no answer (the factory settled its verifier before
@@ -2900,6 +2925,7 @@ fn an_already_settled_child_never_re_scores_as_an_unreachable_error() {
         notice_delivered: false,
         factory: false,
         prompt_admitted: true,
+        prompt_release: Arc::default(),
         retirement: Retirement::live(),
         usage_registration_forgotten: false,
         session_file: None,
@@ -2972,6 +2998,7 @@ async fn the_unreachable_give_up_skips_the_exit_capture_when_a_capture_stands() 
         notice_delivered: false,
         factory: false,
         prompt_admitted: true,
+        prompt_release: Arc::default(),
         retirement: Retirement::live(),
         usage_registration_forgotten: false,
         session_file: Some(

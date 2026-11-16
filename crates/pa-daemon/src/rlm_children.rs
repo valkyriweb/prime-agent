@@ -193,6 +193,10 @@ struct ChildRecord {
     /// The task prompt was admitted; never settle a pre-prompt child (it
     /// is idle with an empty queue by construction).
     prompt_admitted: bool,
+    /// Set by a blocking `collect` that targets this child before its
+    /// prompt admitted: the held task prompt starts without waiting for the
+    /// spawning turn to complete (the collect parks that turn).
+    prompt_release: Arc<std::sync::atomic::AtomicBool>,
     /// The delete or close of this child, kept apart from `run` so a live run
     /// is never faked settled during a delete's kill.
     retirement: Retirement,
@@ -373,6 +377,10 @@ struct SupervisorChildSessionsInner {
     /// The parent worker's turn boundary: prompt tasks spawned mid-turn wait for that turn to
     /// complete (the continuation is in flight before the child's first model turn).
     parent_turn: tokio::sync::watch::Sender<ParentTurn>,
+    /// Fired when a detached task prompt finishes its admission attempt
+    /// (admitted, failed, or dropped with a closed parent): a blocking
+    /// `collect` waits for admission before it waits for the child's idle.
+    prompt_admission: tokio::sync::Notify,
     /// The parent engine's child-settle hook (goal continuation resume).
     settle_hook: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Whether any tracked child run is unsettled (the `any_running`
@@ -440,6 +448,7 @@ impl SupervisorChildSessions {
                 pending_spawn_names: std::sync::Mutex::new(std::collections::HashSet::new()),
                 deleted_children: std::sync::Mutex::new(std::collections::HashMap::new()),
                 parent_turn: tokio::sync::watch::Sender::new(ParentTurn::default()),
+                prompt_admission: tokio::sync::Notify::new(),
                 settle_hook: std::sync::Mutex::new(None),
                 running: tokio::sync::watch::Sender::new(false),
                 settle_notify: tokio::sync::Notify::new(),
@@ -741,6 +750,7 @@ impl SupervisorChildSessions {
                 notice_delivered: false,
                 factory: false,
                 prompt_admitted: true,
+                prompt_release: Arc::default(),
                 retirement: Retirement::live(),
                 usage_registration_forgotten: false,
                 session_file: None,
@@ -1024,13 +1034,16 @@ impl SupervisorChildSessionsInner {
     }
 
     /// Wait for the parent turn that spawned a task to complete (generation
-    /// strictly greater than the one captured at spawn admission). Bounded:
-    /// a turn that never settles releases the child anyway.
-    pub async fn wait_turn_done(&self, generation: u64) {
+    /// strictly greater than the one captured at spawn admission), or for a
+    /// blocking `collect` to set `release` (it wakes the turn channel).
+    /// Bounded: a turn that never settles releases the child anyway.
+    pub async fn wait_turn_done(&self, generation: u64, release: &std::sync::atomic::AtomicBool) {
         let mut receiver = self.parent_turn.subscribe();
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(TURN_DONE_WAIT_SECS),
-            receiver.wait_for(|turn| turn.completed > generation),
+            receiver.wait_for(|turn| {
+                turn.completed > generation || release.load(std::sync::atomic::Ordering::SeqCst)
+            }),
         )
         .await;
     }
